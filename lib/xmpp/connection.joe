@@ -1,0 +1,295 @@
+net = require 'net'
+{EventEmitter} = require 'events'
+util = require 'util'
+ltx = require 'ltx'
+StreamParser = require './stream_parser'
+starttls = require '../starttls'
+
+@?NS_XMPP_TLS     = 'urn:ietf:params:xml:ns:xmpp-tls'
+@?NS_STREAM       = 'http://etherx.jabber.org/streams'
+@?NS_XMPP_STREAMS = 'urn:ietf:params:xml:ns:xmpp-streams'
+
+#  Base class for connection-based streams (TCP).
+#  The socket parameter is optional for incoming connections.
+
+MAX_RECONNECT_DELAY = 30 * 1000
+
+
+Connection := (opts) ->
+    EventEmitter.call(this)
+
+    @streamAttrs  = opts.streamAttrs || {}
+    @xmlns        = opts.xmlns || {}
+    @xmlns.stream = NS_STREAM
+    @socket       = opts.socket || new net.Socket()
+    @reconnectDelay = 0
+    @setupStream()
+
+    if @socket.readable
+        @startParser()
+    else
+        @socket.on 'connect', =>
+            @startParser()
+            @emit 'connect'
+
+    @mixins = []
+
+util.inherits Connection, EventEmitter
+exports.Connection = Connection
+
+# Defaults
+Connection::allowTLS = true
+
+# Used by both the constructor and by reinitialization in setSecure().
+Connection::setupStream = ->
+
+    @socket.addListener 'data', (data) =>
+        @onData data
+    @socket.addListener 'end', =>
+        console.log "socket:end"
+        @onEnd()
+    @socket.addListener 'error', =>
+        console.log "socket:error"
+        # unhandled errors may throw up in node, preventing a reconnect
+        @onEnd()
+    @socket.addListener 'close', =>
+        console.log "socket:close"
+        @onClose()
+
+    proxyEvent := (event) =>
+        @socket.addListener event, =>
+            args = Array::slice.call arguments
+            args.unshift event
+            @emit.apply self, args
+
+    proxyEvent 'data' # let them sniff unparsed XML
+    proxyEvent 'drain'
+    # proxyEvent 'close'
+
+    # This is optimized for continuous TCP streams. If your "socket"
+    # actually transports frames (WebSockets) and you can't have
+    # stanzas split across those, use:
+    #   cb(el.toString());
+    unless this.socket.serializeStanza
+        @socket.serializeStanza = (el, cb) ->
+            # Continuously write out
+            el.write (s) ->
+                cb(s)
+
+Connection::pause = ->
+    if @socket.pause
+        @socket.pause()
+
+Connection::resume = ->
+    if @socket.resume
+        @socket.resume()
+
+# Climbs the stanza up if a child was passed,
+# but you can send strings and buffers too.
+#
+# Returns whether the socket flushed data.
+Connection::send = (stanza) ->
+    flushed = true
+    unless @socket
+        return # Doh!
+    unless @socket.writable
+        @socket.end()
+        return
+
+    if stanza.root
+        el = @rmXmlns(stanza.root())
+        @socket.serializeStanza el, (s) =>
+            flushed = @socket.write(s)
+    else
+        flushed = @socket.write(stanza)
+
+    return flushed
+
+Connection::startParser = ->
+    @parser = new StreamParser.StreamParser(@maxStanzaSize)
+
+    @parser.addListener 'streamStart', (attrs) =>
+        # We need those xmlns often, store them extra
+        @streamNsAttrs = {}
+        for k of attrs
+          if k is 'xmlns' or
+             k.substr(0, 6) is 'xmlns:'
+                @streamNsAttrs[k] = attrs[k]
+
+        # Notify in case we don't wait for <stream:features/>
+        #  (Component or non-1.0 streams)
+        @emit('streamStart', attrs)
+
+    @parser.addListener 'stanza', (stanza) =>
+        @onStanza(@addStreamNs(stanza))
+
+    @parser.addListener 'error', (e) =>
+        @error(e.condition or 'internal-server-error', e.message)
+
+    @parser.addListener 'end', =>
+        @stopParser()
+        @end()
+
+Connection::stopParser = ->
+    # No more events, please (may happen however)
+    if @parser
+        # Get GC'ed
+        @!parser
+
+Connection::startStream = ->
+    # reset reconnect delay
+    @reconnectDelay = 0
+    
+    attrs = {}
+    for k of @xmlns
+        if @xmlns.hasOwnProperty(k)
+            if not k
+                attrs.xmlns = @xmlns[k]
+            else
+                attrs['xmlns:' + k] = @xmlns[k]
+    for k of @streamAttrs
+        if @streamAttrs.hasOwnProperty(k)
+            attrs[k] = @streamAttrs[k]
+
+    el = new ltx.Element('stream:stream', attrs)
+    # make it non-empty to cut the closing tag
+    el.t(' ')
+    s = el.toString()
+    @send(s.substr(0, s.indexOf(' </stream:stream>')))
+
+    @streamOpened = true
+
+Connection::onData = (data) ->
+    if @parser
+        @parser.write(data)
+
+Connection::setSecure = (credentials, isServer) ->
+    # Remove old event listeners
+    @socket.removeAllListeners('data')
+    # retain socket 'end' listeners because ssl layer doesn't support it
+    @socket.removeAllListeners('drain')
+    @socket.removeAllListeners('close')
+    # remove idle_timeout
+    if @socket.clearTimer
+        @socket.clearTimer()
+
+    @stopParser()
+    ct = starttls @socket, (credentials or @credentials), isServer, =>
+        @isSecure = true
+        @startParser()
+        unless isServer
+            # Clients start <stream:stream>, servers reply
+            @startStream()
+
+    ct.on 'close', ->
+        @onClose()
+
+    # The socket is now the cleartext stream
+    @socket = ct
+
+    # Attach new listeners on the cleartext stream
+    @setupStream()
+
+# This is not an event listener, but takes care of the TLS handshake
+# before 'stanza' events are emitted to the derived classes.
+Connection::onStanza = (stanza) ->
+    if stanza.is('error', NS_STREAM)
+        # TODO: extract error text
+        @emit('error', stanza)
+    else if (stanza.is('features', NS_STREAM) and
+             @allowTLS and
+             !@isSecure and
+             stanza.getChild('starttls', NS_XMPP_TLS))
+        # Signal willingness to perform TLS handshake
+        @send(new ltx.Element('starttls', { xmlns: NS_XMPP_TLS }))
+    else if (@allowTLS and
+             stanza.is('proceed', NS_XMPP_TLS))
+        # Server is waiting for TLS handshake
+        @setSecure()
+    else
+        @emit('stanza', stanza)
+
+# Add stream xmlns to a stanza
+#
+# Does not add our default xmlns as it is different for
+# C2S/S2S/Component connections.
+Connection::addStreamNs = (stanza) ->
+    for attr of @streamNsAttrs
+        if (!stanza.attrs[attr] and
+            !(attr is 'xmlns' and
+              @streamNsAttrs[attr] is @xmlns['']))
+            stanza.attrs[attr] = @streamNsAttrs[attr]
+
+    return stanza
+
+# Remove superfluous xmlns that were aleady declared in
+# our <stream:stream>
+Connection::rmXmlns = (stanza) ->
+    for prefix of @xmlns
+        attr = if prefix then 'xmlns:'+prefix else 'xmlns'
+        if stanza.attrs[attr] is @xmlns[prefix]
+            stanza.attrs![attr]
+
+    return stanza
+
+
+# Connection has been ended by remote, we will not get any incoming
+# 'data' events. Alternatively, used for 'error' event.
+Connection::onEnd = ->
+    @stopParser()
+    @socket.end()
+
+# XMPP-style end connection for user
+Connection::end = ->
+    if @socket.writable
+        if @streamOpened
+            @socket.write('</stream:stream>')
+            @!streamOpened
+            # wait for being called again upon 'end' from other side
+        else
+            @socket.end()
+
+Connection::onClose = ->
+    if not @socket
+        # A reconnect may have already been scheduled
+        return
+
+    this!socket
+    if @reconnect
+        setTimeout =>
+            @socket = new net.Stream()
+            @setupStream()
+            @reconnect()
+        , @reconnectDelay
+        console.log "Reconnect in", @reconnectDelay
+        @reconnectDelay += Math.ceil(Math.random() * 2000)
+        if @reconnectDelay > MAX_RECONNECT_DELAY
+            @reconnectDelay = MAX_RECONNECT_DELAY
+
+    else
+        @emit('close')
+
+# End connection with stream error.
+# Emits 'error' event too.
+#
+# @param {String} condition XMPP error condition, see RFC3920 4.7.3. Defined Conditions
+# @param {String} text Optional error message
+Connection::error = (condition, message) ->
+    @emit 'error', new Error(message)
+
+    if !this.socket or !this.socket.writable
+        return
+
+    if !this.streamOpened
+        @startStream(); # RFC 3920, 4.7.1 stream-level errors rules
+
+    e = new ltx.Element('stream:error')
+    e.c(condition, { xmlns: NS_XMPP_STREAMS })
+    if message
+        e.c('text', {
+          'xmlns':    NS_XMPP_STREAMS,
+          'xml:lang': 'en' }).
+        t(message)
+
+    @send(e)
+    @end()
