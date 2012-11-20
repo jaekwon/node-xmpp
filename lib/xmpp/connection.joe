@@ -14,8 +14,7 @@ starttls = require '../starttls'
 
 MAX_RECONNECT_DELAY = 30 * 1000
 
-
-Connection := (opts) ->
+@?Connection := (opts) ->
     EventEmitter.call(this)
 
     @streamAttrs  = opts.streamAttrs || {}
@@ -35,7 +34,6 @@ Connection := (opts) ->
     @mixins = []
 
 util.inherits Connection, EventEmitter
-exports.Connection = Connection
 
 # Defaults
 Connection::allowTLS = true
@@ -60,7 +58,7 @@ Connection::setupStream = ->
         @socket.addListener event, =>
             args = Array::slice.call arguments
             args.unshift event
-            @emit.apply self, args
+            @emit.apply @, args
 
     proxyEvent 'data' # let them sniff unparsed XML
     proxyEvent 'drain'
